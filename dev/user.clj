@@ -5,7 +5,7 @@
 (defmacro with-timed [s & body]
   `(let [t0# (System/currentTimeMillis)]
      (try ~@body
-          (finally (log/info "Time segment" ~s (- (System/currentTimeMillis) t0#))))))
+          (finally (log/debug "Time segment" ~s (- (System/currentTimeMillis) t0#))))))
 
 (defn run-a-test [node iters]
   (let [id (java.util.UUID/randomUUID)
@@ -16,7 +16,7 @@
              tx (crux/submit-tx node [[:crux.tx/put {:crux.db/id id :some-data d :i i}]])]
          (with-timed "await-tx"
            (crux/await-tx node tx))
-         (log/info "Iteration" i "of" iters ": TX" tx "arrived, waiting for id " id)
+         (log/debug "Iteration" i "of" iters ": TX" tx "arrived, waiting for id " id)
          (let [[r]
                (first (crux/q (crux/db node)
                               {:find '[d] :where '[[e :crux.db/id id]

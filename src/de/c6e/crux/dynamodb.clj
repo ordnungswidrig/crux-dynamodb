@@ -10,20 +10,15 @@
   (:import software.amazon.awssdk.services.dynamodb.DynamoDbClient
            software.amazon.awssdk.services.dynamodb.model.DescribeTableRequest
            software.amazon.awssdk.services.dynamodb.model.TableDescription
-           software.amazon.awssdk.services.dynamodb.model.GetItemRequest
            software.amazon.awssdk.services.dynamodb.model.GetItemResponse
-           software.amazon.awssdk.services.dynamodb.model.GetItemRequest$Builder
-           software.amazon.awssdk.services.dynamodb.model.Put
            software.amazon.awssdk.services.dynamodb.model.AttributeValue
            software.amazon.awssdk.services.dynamodb.model.AttributeValue$Builder
-           software.amazon.awssdk.services.dynamodb.model.TransactWriteItem
-           software.amazon.awssdk.services.dynamodb.model.TransactWriteItemsRequest
-           software.amazon.awssdk.services.dynamodb.model.TransactWriteItemsRequest$Builder
+           software.amazon.awssdk.services.dynamodb.model.PutItemRequest
+           software.amazon.awssdk.services.dynamodb.model.PutItemRequest$Builder
            software.amazon.awssdk.services.dynamodb.model.QueryRequest
            software.amazon.awssdk.services.dynamodb.model.QueryResponse
            software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException
-           software.amazon.awssdk.services.dynamodb.model.TransactionCanceledException
-           software.amazon.awssdk.services.dynamodb.model.TransactionConflictException
+           software.amazon.awssdk.services.dynamodb.model.ConditionalCheckFailedException
            software.amazon.awssdk.core.exception.SdkClientException
            software.amazon.awssdk.core.exception.AbortedException
            software.amazon.awssdk.core.SdkBytes))
@@ -41,15 +36,10 @@
 ;; Example-data
 ;;
 ;; partition | tx | events  | tx-time       | last
-;; default   | -1 |         |               | 2
 ;; default   |  1 | bgFy... | 1591111570009 |
 ;; default   |  2 | bgFy... | 1591111576234 |
 ;;
-;; The entry at tx "-1" is used to store that last used tx-id. This might be redundant. And be
-;; replaced by a reverse sort on tx.
-
 ;; possible improvements
-;; - drop "last-id-used" value at "-1" in favour of query for the last and CAS in tx-id existence
 ;; - shard id over partitions to enhance performance but scanning for next tx could be tricky
 
 (set! *warn-on-reflection* true)
@@ -75,19 +65,23 @@
     (.asByteArray sdk-bytes)))
 
 
-;; determine the last tx id used in the partition. Uses the store last-id value
 (defn last-tx-id [^DynamoDbClient ddb-client ^String table-name ^String partition-name]
-  (try
-    (let [r (-> ^GetItemRequest$Builder
-                (GetItemRequest/builder) (.key {partition-key (s partition-name)
-                                                sort-key (n -1)})
-                (.tableName table-name) .build)
-          ^GetItemResponse item (.getItem ddb-client ^GetItemRequest r)
-          ^AttributeValue last (-> item .item (.get "last"))]
-      (some-> last
-              .n
-              Integer/parseInt))
-    (catch ResourceNotFoundException _ nil)))
+  (let [r (-> (QueryRequest/builder)
+              (.tableName table-name)
+              (.consistentRead true)
+              (.keyConditionExpression "#p = :p")
+              (.expressionAttributeNames {"#p" "partition"})
+              (.expressionAttributeValues {":p" (s partition-name)})
+              (.scanIndexForward false)
+              (.limit (int 1))
+              .build)
+
+        qr ^QueryResponse (.query ddb-client ^QueryRequest r)
+        item ^java.util.Map (first (.items qr))
+        ^AttributeValue last (some-> item (.get "tx"))]
+    (some-> last
+            .n
+            Integer/parseInt)))
 
 ;; query for all tx after last-tx-id and return a lazyseq. Maybe also could use DynamoDbClient#queryPaginator
 ;; which directly returns a Iterable. The function takes an atom as a "close-flag" to signal the request
@@ -134,7 +128,8 @@
                    ;; return and thus stop lazy-seq'ing
                    [])
                  (catch AbortedException e
-                   (log/info "AWS call aborted stopping tx log query.")
+                   (log/info "AWS call aborted stopping tx log query")
+                   (log/debug "AWS abort exception was" e)
                    ;; return and thus stop lazy-seq'ing
                    [])))))]
     (q* nil)))
@@ -156,6 +151,31 @@
               (recur (inc i)))
           (throw (Exception. (format "Giving up after %s attempts." max) e)))))))
 
+(defn insert-tx [^DynamoDbClient ddb-client table-name partition-name tx-events]
+  (let [last-id (last-tx-id ddb-client table-name partition-name)
+        _ (log/debug "submitting tx, last tx id was" last-id)
+
+        tx-id (inc (or last-id 0))
+        tx-time (System/currentTimeMillis)
+
+        item-values {partition-key (s partition-name)
+                     sort-key (n tx-id)
+                     "tx-time" (n tx-time)
+                     "events"  (b (nippy/fast-freeze tx-events))}
+
+        pirb ^PutItemRequest$Builder (PutItemRequest/builder)
+
+        ^PutItemRequest pir (-> pirb
+                                (.item item-values)
+                                (.tableName table-name)
+                                (.conditionExpression (format "attribute_not_exists(%s)" sort-key))
+                                .build)]
+
+    (let [r (.putItem ddb-client pir)]
+      (log/debug "Put item succeeded" r)
+      {::tx/tx-id tx-id
+       ::tx/tx-time tx-time})))
+
 (defrecord DynamoDBTxLog [^DynamoDbClient ddb-client ^String table-name ^String partition-name]
   db/TxLog
   (submit-tx [this tx-events]
@@ -165,50 +185,10 @@
     (log/debug "submit-tx" :tx-events tx-events)
     (delay
       (try
-        (retry-on #(instance? TransactionCanceledException %)
+        (retry-on #(instance? ConditionalCheckFailedException %)
                   20
-                  (fn []
-                    (let [last-id (last-tx-id ddb-client table-name partition-name)
-                          _ (log/debug "submitting tx, last tx id was" last-id)
+                  (fn [] (insert-tx ddb-client table-name partition-name tx-events)))
 
-                          tx-id (inc (or last-id 0))
-                          tx-time (System/currentTimeMillis)
-
-                          item-values {partition-key (s partition-name)
-                                       sort-key  (n tx-id)
-                                       "tx-time" (n tx-time)
-                                       "events"       (b (nippy/fast-freeze tx-events))}
-
-                          ^Put tx-put-items (-> (Put/builder) (.tableName table-name) (.item item-values) .build)
-
-                          ^Put tx-update-id (cond-> (-> (Put/builder)
-                                                        (.tableName table-name)
-                                                        (.item {"partition" (s partition-name)
-                                                                "tx"        (n -1)
-                                                                "last"      (n tx-id)}))
-                                              last-id (.conditionExpression "#last = :lastid")
-                                              last-id (.expressionAttributeValues {":lastid" (n last-id)})
-                                              last-id (.expressionAttributeNames {"#last" "last"})
-                                              :always  .build)
-
-                          ^TransactWriteItem items-wi (-> (TransactWriteItem/builder)
-                                                          (.put tx-put-items)
-                                                          .build)
-
-                          ^TransactWriteItem update-id-wi (-> (TransactWriteItem/builder)
-                                                              (.put tx-update-id)
-                                                              .build)
-
-                          ^java.util.Collection twis [items-wi update-id-wi]
-
-                          twir (-> ^TransactWriteItemsRequest$Builder
-                                   (TransactWriteItemsRequest/builder)
-                                   (.transactItems twis)
-                                   .build)]
-                      (let [r (.transactWriteItems ddb-client ^TransactWriteItemsRequest twir)]
-                        (log/debug "Transaction succeded" r)
-                        {::tx/tx-id tx-id
-                         ::tx/tx-time tx-time}))))
         (catch ResourceNotFoundException e
           (throw (ex-info "DynamoDb table not found" {:table-name table-name} e))))))
 
