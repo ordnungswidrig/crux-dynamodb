@@ -1,0 +1,10 @@
+{:deps {juxt/crux-core          {:mvn/version "20.05-1.8.4-alpha"}
+        juxt/crux-s3            {:mvn/version "20.05-1.8.4-alpha"}
+        software.amazon.awssdk/dynamodb {:mvn/version "2.10.61"}
+        ch.qos.logback/logback-classic  {:mvn/version "1.2.3"}
+        }
+
+ :aliases  {:test {:main-opts  ["-m" "user"]
+                   :extra-paths ["test" "dev"]
+                   :extra-deps {ch.qos.logback/logback-classic  {:mvn/version "1.2.3"}}}}
+ }
